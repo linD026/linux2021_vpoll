@@ -28,7 +28,7 @@ int pre_fork_setup(state *state __attribute__((unused))) {
   struct epoll_event tmp = {
       .events =
           EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLOUT | EPOLLHUP | EPOLLPRI,
-      .data.u64 = 0,
+      .data.u64 = 123456789,
   };
   state->ev = tmp;
 
@@ -55,7 +55,10 @@ int child_warmup(int warmup_iters __attribute__((unused)),
 int child_loop(int iters, state *state) {
   printf("child efd %d \n", state->efd);
   for (int i = 0; i < iters; ++i) {
-    ioctl(state->efd, VPOLL_IO_ADDEVENTS, EPOLLIN);
+    if (i % 2)
+        ioctl(state->efd, VPOLL_IO_ADDEVENTS, EPOLLIN);
+    else
+        ioctl(state->efd, VPOLL_IO_ADDEVENTS, EPOLLOUT);
   }
   ioctl(state->efd, VPOLL_IO_ADDEVENTS, EPOLLHUP);
 
@@ -77,7 +80,6 @@ int parent_loop(int iters __attribute__((unused)), state *state) {
     if (nfds == 0)
       printf("timeout...\n");
     else {
-      printf("GOT event %x\n", state->ev.events);
       ioctl(state->efd, VPOLL_IO_DELEVENTS, state->ev.events);
       if (state->ev.events & EPOLLHUP) break;
     }

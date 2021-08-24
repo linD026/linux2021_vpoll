@@ -5,6 +5,8 @@
 #include <linux/slab.h>
 #include <linux/ftrace.h>
 #include <linux/kallsyms.h>
+#include <linux/mutex.h>
+#include <linux/delay.h>
 
 #include "trace_time.h"
 
@@ -36,6 +38,9 @@ struct ftrace_hook {
     unsigned long address;
     struct ftrace_ops ops;
 };
+
+static atomic_t do_epoll_wait_cnt = ATOMIC_INIT(0);
+static int block = 0;
 
 static int hook_resolve_addr(struct ftrace_hook *hook)
 {
@@ -117,16 +122,21 @@ static int hook_do_epoll_wait(int epfd, struct epoll_event __user *events,
                               int maxevents, struct timespec64 *to)
 {
     int ret;
+    
+    if (block)
+        return -EAGAIN;
 
+    atomic_inc(&do_epoll_wait_cnt);
     if (events->data == 123456789) {
-        tt_do_epoll_wait = TRACE_TIME_INIT("do_epoll_wait");
         TRACE_TIME_START(tt_do_epoll_wait);
         ret = real_do_epoll_wait(epfd, events, maxevents, to);
         TRACE_TIME_END(tt_do_epoll_wait);
         TRACE_CALC(tt_do_epoll_wait);
         TRACE_PRINT(tt_do_epoll_wait);
-    } else
+    	tt_do_epoll_wait = TRACE_TIME_INIT("do_epoll_wait");
+	} else
         ret = real_do_epoll_wait(epfd, events, maxevents, to);
+    atomic_dec(&do_epoll_wait_cnt);
 
     return ret;
 }
@@ -139,6 +149,8 @@ static void init_hook(void)
     hook.orig = &real_do_epoll_wait;
     hook_install(&hook);
 }
+
+static struct trace_time tt_wake_up;
 
 static int vpoll_open(struct inode *inode, struct file *file)
 {
@@ -178,9 +190,11 @@ static long vpoll_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
     if (res >= 0) {
         res = vpoll_data->events;
-        if (waitqueue_active(&vpoll_data->wqh))
+        if (waitqueue_active(&vpoll_data->wqh)) {
+            TRACE_TIME_START(tt_wake_up);
             /*WWW*/ wake_up_locked_poll(&vpoll_data->wqh, vpoll_data->events);
-        // wake_up_poll(&vpoll_data->wqh, vpoll_data->events);
+            // wake_up_poll(&vpoll_data->wqh, vpoll_data->events);
+        }
     }
     spin_unlock_irq(&vpoll_data->wqh.lock);
     return res;
@@ -191,6 +205,10 @@ static __poll_t vpoll_poll(struct file *file, struct poll_table_struct *wait)
     struct vpoll_data *vpoll_data = file->private_data;
 
     poll_wait(file, &vpoll_data->wqh, wait);
+    TRACE_TIME_END(tt_wake_up);
+    TRACE_CALC(tt_wake_up);
+    TRACE_PRINT(tt_wake_up);
+    tt_wake_up = TRACE_TIME_INIT("wake_up_locked_poll");
 
     return READ_ONCE(vpoll_data->events);
 }
@@ -235,7 +253,9 @@ static int __init vpoll_init(void)
     if ((ret = cdev_add(&vpoll_cdev, major, 1)) < 0)
         goto error_device_destroy;
 
-    init_hook();
+    // init_hook();
+    tt_do_epoll_wait = TRACE_TIME_INIT("do_epoll_wait");
+    tt_wake_up = TRACE_TIME_INIT("wake_up_locked_poll");
 
     printk(KERN_INFO NAME ": loaded\n");
     return 0;
@@ -251,7 +271,14 @@ error_unregister_chrdev_region:
 
 static void __exit vpoll_exit(void)
 {
-    hook_remove(&hook);
+    block = 1;
+    if (atomic_read(&do_epoll_wait_cnt) > 0) {
+        pr_info("Warning! Someone(%d) still using hook function\n", atomic_read(&do_epoll_wait_cnt));
+        mdelay(20);
+    }
+
+    // hook_remove(&hook);
+    mdelay(20);
     device_destroy(vpoll_class, major);
     cdev_del(&vpoll_cdev);
     class_destroy(vpoll_class);
